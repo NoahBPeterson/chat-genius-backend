@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres
+    env_file:
+      - .env
+    volumes:
+      - ./schema.sql:/schema.sql
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+      - ./.env:/.env
+    ports:
+      - "${DB_PORT}:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=postgres
+
+volumes:
+  postgres_data: 
