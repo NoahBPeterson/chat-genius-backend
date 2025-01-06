@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS channels (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
-    is_private BOOLEAN DEFAULT FALSE
+    is_private BOOLEAN DEFAULT FALSE,
+    role VARCHAR(50) DEFAULT 'member',
+    is_dm BOOLEAN DEFAULT FALSE,
+    dm_participants INTEGER[] DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS reactions (
@@ -34,3 +37,22 @@ CREATE TABLE IF NOT EXISTS reactions (
     user_id INT NOT NULL,
     emoji VARCHAR(50) NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS user_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL,
+    token VARCHAR(255) NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+ALTER TABLE channels ADD CONSTRAINT unique_channel_name UNIQUE (name);
+
+insert into channels (name) values ('general');
+
+ALTER TABLE users ADD COLUMN role VARCHAR(50) DEFAULT 'member';
+ALTER TABLE channels ADD COLUMN role VARCHAR(50) DEFAULT 'member';
+
+# Adding DMs
+ALTER TABLE channels ADD COLUMN is_dm BOOLEAN DEFAULT FALSE;
+ALTER TABLE channels ADD COLUMN dm_participants INTEGER[] DEFAULT NULL;
