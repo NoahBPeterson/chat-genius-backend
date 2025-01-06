@@ -1,0 +1,28 @@
+{
+  "name": "chat-genius-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "./src/server.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx ./src/server.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/ws": "^8.5.13",
+    "dotenv": "^16.4.7",
+    "hyper-express": "^6.17.3",
+    "pg": "^8.13.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
