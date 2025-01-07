@@ -68,7 +68,7 @@ const authorize = (allowedRoles: string[]) => {
 // Example route: Fetch all channels
 app.get('/api/channels', authorize(['admin', 'member']), async (req: Request, res: Response) => {
     try {
-        const { rows } = await pool.query('SELECT * FROM channels');
+        const { rows } = await pool.query('SELECT * FROM channels WHERE is_dm = false');
         res.json(rows);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -111,26 +111,34 @@ app.get('/api/channels/:id/messages', authorize(['admin', 'member']), async (req
         
         // Fetch the channel to check access
         const channelResult = await pool.query('SELECT * FROM channels WHERE id = $1', [channelId]);
-        if (channelResult.rows.length === 0) return res.status(404).json({ error: 'Channel not found' });
+        if (channelResult.rows.length === 0) 
+            return res.status(404).json({ error: 'Channel not found' });
 
         const channel = channelResult.rows[0];
         const userRole = (req as any).user.role;
 
         // Check access permissions
         if (channel.is_dm) {
-            // For DM channels, check if user is a participant
             if (!channel.dm_participants.includes(currentUserId)) {
                 return res.status(403).json({ error: 'Forbidden: You are not a participant in this conversation' });
             }
         } else {
-            // For regular channels, check role-based access
             if (channel.role && channel.role !== userRole && userRole !== 'admin') {
                 return res.status(403).json({ error: 'Forbidden: You do not have access to this channel' });
             }
         }
 
-        // Fetch messages for the channel
-        const { rows } = await pool.query('SELECT * FROM messages WHERE channel_id = $1', [channelId]);
+        // Fetch messages with user information
+        const { rows } = await pool.query(`
+            SELECT 
+                m.*,
+                COALESCE(u.display_name, u.email) as display_name
+            FROM messages m
+            JOIN users u ON m.user_id = u.id
+            WHERE m.channel_id = $1
+            ORDER BY m.created_at ASC
+        `, [channelId]);
+
         res.json(rows);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -239,10 +247,9 @@ app.get('/api/users', authorize(['admin', 'member']), async (req: Request, res: 
         const currentUserId = (req as any).user.userId;
         
         const { rows } = await pool.query(
-            'SELECT id, display_name as displayname FROM users WHERE id != $1 ORDER BY display_name',
-            [currentUserId]
+            'SELECT id, display_name, email FROM users ORDER BY id'
         );
-        
+
         res.json(rows);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
