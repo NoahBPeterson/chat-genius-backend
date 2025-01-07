@@ -7,6 +7,8 @@ import { WebSocket, WebSocketServer } from 'ws';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 dotenv.config();
 
@@ -17,6 +19,14 @@ const pool = new Pool({
     database: process.env.DB_NAME,
     password: process.env.DB_PASSWORD,
     port: parseInt(process.env.DB_PORT as string),
+});
+
+const s3Client = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID as string,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY as string
+    }
 });
 
 // Middleware to authenticate requests
@@ -318,6 +328,98 @@ app.get('/api/messages/search', authorize(['admin', 'member']), async (req: Requ
     }
 });
 
+app.post('/api/upload/request-url', authorize(['admin', 'member']), async (req: Request, res: Response) => {
+    try {
+        const { filename, contentType, size } = await req.json();
+        
+        // Generate unique storage path
+        const storagePath = `uploads/${Date.now()}-${filename}`;
+        
+        // Create command for generating pre-signed URL
+        const command = new PutObjectCommand({
+            Bucket: process.env.AWS_BUCKET_NAME,
+            Key: storagePath,
+            ContentType: contentType
+        });
+
+        // Generate pre-signed URL
+        const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+
+        res.json({
+            uploadUrl: signedUrl,
+            storagePath: storagePath
+        });
+    } catch (error: any) {
+        console.error('Upload URL generation error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/files/uploads/:filename(*)', authorize(['admin', 'member']), async (req: Request, res: Response) => {
+    try {   
+        const filename = req.params['filename(*)'];
+
+        // Get file info from database - look up by storage path instead of filename
+        const fileResult = await pool.query(
+            'SELECT * FROM file_attachments WHERE storage_path LIKE $1',
+            [`%${filename}`]
+        );
+        
+        if (fileResult.rows.length === 0) {
+            return res.status(404).json({ error: 'File not found in database' });
+        }
+
+        const file = fileResult.rows[0];
+        
+        // Create command for generating download URL
+        const command = new GetObjectCommand({
+            Bucket: process.env.AWS_BUCKET_NAME,
+            Key: file.storage_path
+        });
+
+        // Generate pre-signed URL for downloading
+        const signedUrl = await getSignedUrl(s3Client, command, { 
+            expiresIn: file.is_image ? 24 * 3600 : 300 // 24 hours for images, 5 minutes for other files
+        });
+
+        res.json({ 
+            downloadUrl: signedUrl,
+            filename: file.filename,
+            isImage: file.is_image,
+            mimeType: file.mime_type,
+            size: file.size
+        });
+    } catch (error: any) {
+        console.error('Download URL generation error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add this temporarily to debug
+app.get('/api/files/debug', async (req, res) => {
+    const result = await pool.query('SELECT * FROM file_attachments');
+    console.log('All files in database:', result.rows);
+    
+    // Also check messages with attachments
+    const messagesWithFiles = await pool.query(`
+        SELECT m.*, fa.*
+        FROM messages m
+        JOIN file_attachments fa ON m.id = fa.message_id
+    `);
+    // Also check messages with attachments
+    const files = await pool.query(`
+        SELECT *
+        FROM file_attachments
+    `);
+    console.log('Messages with attachments:', messagesWithFiles.rows, files.rows);
+    
+    res.json({
+        files: result.rows,
+        messages: messagesWithFiles.rows,
+        files_only: files.rows
+    });
+});
+
 // Allow requests from the frontend
 app.use(cors({ origin: '*' }));
 app.listen(3000).then((socket) => {
@@ -356,46 +458,122 @@ app.listen(3000).then((socket) => {
 
                 switch (parsed.type) {
                     case 'new_message':
-                        // Verify JWT token
                         try {
                             const decoded = jwt.verify(parsed.token, process.env.JWT_SECRET as string) as { userId: number; role: string };
-
-                            // Insert new message into database
-                            const { rows } = await pool.query(
-                                `INSERT INTO messages (channel_id, user_id, content) 
-                                 VALUES ($1, $2, $3) 
-                                 RETURNING *, 
-                                 (SELECT COALESCE(display_name, email) FROM users WHERE id = user_id) as display_name`,
-                                [parsed.channelId, decoded.userId, parsed.content]
-                            );
-
-                            // Broadcast to all clients
-                            wsServer.clients.forEach((client) => {
-                                if (client.readyState === WebSocket.OPEN) {
-                                    client.send(JSON.stringify({
-                                        type: 'new_message',
-                                        message: rows[0]
-                                    }));
+                            
+                            // Start transaction
+                            const client = await pool.connect();
+                            try {
+                                await client.query('BEGIN');
+                                
+                                // Insert message
+                                const messageResult = await client.query(
+                                    `INSERT INTO messages (channel_id, user_id, content) 
+                                     VALUES ($1, $2, $3) 
+                                     RETURNING *`,
+                                    [parsed.channelId, decoded.userId, parsed.content]
+                                );
+                                
+                                let message = messageResult.rows[0];
+                                
+                                // Handle attachments
+                                if (parsed.attachments?.length > 0) {
+                                    
+                                    // Insert file attachments
+                                    const attachmentPromises = parsed.attachments.map((attachment: { filename: string, mime_type?: string, size?: number, storage_path: string }) => {
+                                        return client.query(
+                                            `INSERT INTO file_attachments (message_id, filename, mime_type, size, storage_path, is_image)
+                                             VALUES ($1, $2, $3, $4, $5, $6)
+                                             RETURNING *`,
+                                            [
+                                                message.id,
+                                                attachment.filename,
+                                                attachment.mime_type || 'application/octet-stream',
+                                                attachment.size || 0,
+                                                attachment.storage_path,
+                                                (attachment.mime_type || '').startsWith('image/')
+                                            ]
+                                        );
+                                    });
+                                    
+                                    const attachmentResults = await Promise.all(attachmentPromises);
+                                    message.attachments = attachmentResults.map(result => result.rows[0]);
                                 }
-                            });
+                                
+                                await client.query('COMMIT');
+                                
+                                // After saving the message and attachments
+                                const fullMessage = await client.query(`
+                                    SELECT 
+                                        m.*,
+                                        COALESCE(u.display_name, u.email) as display_name,
+                                        COALESCE(
+                                            json_agg(
+                                                json_build_object(
+                                                    'id', fa.id,
+                                                    'filename', fa.filename,
+                                                    'mime_type', fa.mime_type,
+                                                    'size', fa.size,
+                                                    'storage_path', fa.storage_path,
+                                                    'is_image', fa.is_image
+                                                )
+                                            ) FILTER (WHERE fa.id IS NOT NULL),
+                                            '[]'::json
+                                        ) as attachments
+                                    FROM messages m
+                                    JOIN users u ON m.user_id = u.id
+                                    LEFT JOIN file_attachments fa ON m.id = fa.message_id
+                                    WHERE m.id = $1
+                                    GROUP BY m.id, u.display_name, u.email
+                                `, [message.id]);
+
+                                // Broadcast to all clients
+                                wsServer.clients.forEach((client) => {
+                                    if (client.readyState === WebSocket.OPEN) {
+                                        client.send(JSON.stringify({
+                                            type: 'new_message',
+                                            message: fullMessage.rows[0]
+                                        }));
+                                    }
+                                });
+                            } catch (error) {
+                                await client.query('ROLLBACK');
+                                throw error;
+                            } finally {
+                                client.release();
+                            }
                         } catch (error) {
-                            // Send error back to the client
+                            console.error('Message processing error:', error);
                             ws.send(JSON.stringify({
                                 type: 'error',
-                                message: 'Invalid or expired token'
+                                message: 'Failed to process message'
                             }));
                         }
                         break;
 
                     case 'request_channel_messages':
-                        // Fetch messages for specific channel
                         const messages = await pool.query(`
                             SELECT 
                                 m.*,
-                                COALESCE(u.display_name, u.email) as display_name
+                                COALESCE(u.display_name, u.email) as display_name,
+                                COALESCE(
+                                    json_agg(
+                                        json_build_object(
+                                            'id', fa.id,
+                                            'filename', fa.filename,
+                                            'mime_type', fa.mime_type,
+                                            'size', fa.size,
+                                            'storage_path', fa.storage_path,
+                                            'is_image', fa.is_image
+                                        )
+                                    ) FILTER (WHERE fa.id IS NOT NULL),
+                                    '[]'::json
+                                ) as attachments
                             FROM messages m
                             JOIN users u ON m.user_id = u.id
+                            LEFT JOIN file_attachments fa ON m.id = fa.message_id
                             WHERE m.channel_id = $1
+                            GROUP BY m.id, u.display_name, u.email
                             ORDER BY m.created_at ASC
                         `, [parsed.channelId]);
                         

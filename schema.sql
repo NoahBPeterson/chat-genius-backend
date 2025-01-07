@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS user_tokens (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS file_attachments (
+    id SERIAL PRIMARY KEY,
+    message_id INTEGER REFERENCES messages(id),
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    storage_path TEXT NOT NULL,
+    is_image BOOLEAN DEFAULT false,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 ALTER TABLE channels ADD CONSTRAINT unique_channel_name UNIQUE (name);
 
 insert into channels (name) values ('general');
