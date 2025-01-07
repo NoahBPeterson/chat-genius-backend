@@ -36,7 +36,6 @@ const authenticate = async (req: Request, res: Response, next: () => void) => {
             return res.status(401).json({ error: 'Unauthorized, token expired' });
         }
         (req as any).user = decoded;
-        next();
     } catch {
         res.status(401).json({ error: 'Invalid token' });
     }
@@ -55,11 +54,10 @@ const authorize = (allowedRoles: string[]) => {
             (req as any).user = decoded;
 
             // Check if the user's role is allowed
-            if (!allowedRoles.includes(decoded.role) || decoded.role !== 'admin') {
+            if (!allowedRoles.includes(decoded.role) && decoded.role !== 'admin') {
                 return res.status(403).json({ error: 'Forbidden: You do not have access to this resource' });
             }
 
-            next();
         } catch (error) {
             return res.status(401).json({ error: 'Unauthorized: Invalid token' });
         }
@@ -109,17 +107,26 @@ app.get('/api/channels/:id', authenticate, async (req: Request, res: Response) =
 app.get('/api/channels/:id/messages', authorize(['admin', 'member']), async (req: Request, res: Response) => {
     try {
         const channelId = req.params.id;
+        const currentUserId = (req as any).user.userId;
         
-        // Fetch the channel to check its required role
+        // Fetch the channel to check access
         const channelResult = await pool.query('SELECT * FROM channels WHERE id = $1', [channelId]);
         if (channelResult.rows.length === 0) return res.status(404).json({ error: 'Channel not found' });
 
         const channel = channelResult.rows[0];
-        const userRole = (req as any).user.role; // Get the user's role from the decoded token
+        const userRole = (req as any).user.role;
 
-        // Check if the user's role is allowed to access this channel
-        if (channel.role && channel.role !== userRole && userRole !== 'admin') {
-            return res.status(403).json({ error: 'Forbidden: You do not have access to this channel' });
+        // Check access permissions
+        if (channel.is_dm) {
+            // For DM channels, check if user is a participant
+            if (!channel.dm_participants.includes(currentUserId)) {
+                return res.status(403).json({ error: 'Forbidden: You are not a participant in this conversation' });
+            }
+        } else {
+            // For regular channels, check role-based access
+            if (channel.role && channel.role !== userRole && userRole !== 'admin') {
+                return res.status(403).json({ error: 'Forbidden: You do not have access to this channel' });
+            }
         }
 
         // Fetch messages for the channel
@@ -137,7 +144,6 @@ app.post('/api/channels/:id/messages', authorize(['admin', 'member']), async (re
         const channelId = req.params.id;
         const userId = (req as any).user.userId; // Get the user ID from the decoded token
         const { content } = await req.json();
-
         // Insert the message into the messages table with user_id
         const { rows } = await pool.query(
             'INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, $3) RETURNING *',
@@ -190,28 +196,97 @@ app.post('/api/login', async (req: Request, res: Response) => {
     }
 });
 
+// Create or get a DM channel between two users
+app.post('/api/dm/:userId', authorize(["member", "admin"]), async (req: Request, res: Response) => {
+    try {
+        const currentUserId = (req as any).user.userId;
+        const targetUserId = parseInt(req.params.userId);
+
+        // Check if DM channel already exists between these users
+        const existingChannel = await pool.query(
+            `SELECT * FROM channels 
+             WHERE is_dm = true 
+             AND dm_participants @> ARRAY[$1]::integer[]
+             AND dm_participants @> ARRAY[$2]::integer[]
+             AND array_length(dm_participants, 1) = 2`,
+            [currentUserId, targetUserId]
+        );
+
+        if (existingChannel.rows.length > 0) {
+            return res.json(existingChannel.rows[0]);
+        }
+
+        // Create new DM channel if it doesn't exist
+        const { rows } = await pool.query(
+            'INSERT INTO channels (name, is_dm, dm_participants, is_private, role) VALUES ($1, true, $2, true, $3) RETURNING *',
+            [
+                `dm-${Math.min(currentUserId, targetUserId)}-${Math.max(currentUserId, targetUserId)}`,
+                [currentUserId, targetUserId],
+                'member'
+            ]
+        );
+
+        res.status(201).json(rows[0]);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+        console.log(error, error.message);
+    }
+});
+
+// Fetch all users (except the current user)
+app.get('/api/users', authorize(['admin', 'member']), async (req: Request, res: Response) => {
+    try {
+        const currentUserId = (req as any).user.userId;
+        
+        const { rows } = await pool.query(
+            'SELECT id, display_name as displayname FROM users WHERE id != $1 ORDER BY display_name',
+            [currentUserId]
+        );
+        
+        res.json(rows);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+        console.log(error, error.message);
+    }
+});
+
+
 // Allow requests from the frontend
 app.use(cors({ origin: '*' }));
 app.listen(3000).then((socket) => {
     console.log('Server running on port 3000');
     const wsServer = new WebSocketServer({ port: 8080 });
-    
+    console.log('WebSocket server running on port 8080');
     wsServer.on('connection', (ws: WebSocket) => {
         ws.on('message', async (message) => {
-            const parsed = JSON.parse(message.toString());
-            // Handle incoming messages
-            if (parsed.type === 'MESSAGE') {
-                await pool.query('INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, $3)', [
-                    parsed.channelId,
-                    parsed.userId,
-                    parsed.content,
-                ]);
-                // Broadcast to all clients
-                wsServer.clients.forEach((client) => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify(parsed));
-                    }
-                });
+            try {
+                const parsed = JSON.parse(message.toString());
+                console.log("websocket", parsed);
+                // Handle incoming messages
+                if (parsed.type === 'MESSAGE') {
+                    // Insert the message and get the created record
+                    /*const { rows } = await pool.query(
+                        'INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, $3) RETURNING *',
+                        [parsed.channelId, parsed.userId, parsed.content]
+                    );
+
+                    // Broadcast the created message to all clients
+                    wsServer.clients.forEach((client) => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(JSON.stringify({
+                                type: 'MESSAGE',
+                                message: rows[0]  // Send the complete message object
+                            }));
+                        }
+                    });*/
+                }
+            } catch (error) {
+                console.error('WebSocket message error:', error);
+                // Optionally send error back to the client
+                ws.send(JSON.stringify({
+                    type: 'ERROR',
+                    error: 'Failed to process message'
+                }));
             }
         });
     });
