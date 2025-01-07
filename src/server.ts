@@ -264,37 +264,136 @@ app.listen(3000).then((socket) => {
     console.log('Server running on port 3000');
     const wsServer = new WebSocketServer({ port: 8080 });
     console.log('WebSocket server running on port 8080');
+    
     wsServer.on('connection', (ws: WebSocket) => {
+        console.log('Client connected');
+
+        // Send initial data on connection
+        const sendInitialData = async () => {
+            try {
+                const channels = await pool.query('SELECT * FROM channels WHERE is_dm = false');
+                const users = await pool.query('SELECT id, display_name, email FROM users ORDER BY id');
+                
+                console.log('Initial users data:', users.rows);
+                
+                ws.send(JSON.stringify({
+                    type: 'channel_update',
+                    channels: channels.rows
+                }));
+                
+                ws.send(JSON.stringify({
+                    type: 'user_update',
+                    users: users.rows
+                }));
+                console.log('Sent initial users to client:', users.rows);
+            } catch (error) {
+                console.error('Error sending initial data:', error);
+            }
+        };
+
+        sendInitialData();
+
+        // Handle messages
         ws.on('message', async (message) => {
             try {
                 const parsed = JSON.parse(message.toString());
-                console.log("websocket", parsed);
-                // Handle incoming messages
-                if (parsed.type === 'MESSAGE') {
-                    // Insert the message and get the created record
-                    /*const { rows } = await pool.query(
-                        'INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, $3) RETURNING *',
-                        [parsed.channelId, parsed.userId, parsed.content]
-                    );
+                console.log("Received websocket message:", parsed);
 
-                    // Broadcast the created message to all clients
-                    wsServer.clients.forEach((client) => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
-                                type: 'MESSAGE',
-                                message: rows[0]  // Send the complete message object
+                switch (parsed.type) {
+                    case 'new_message':
+                        // Verify JWT token
+                        try {
+                            const decoded = jwt.verify(parsed.token, process.env.JWT_SECRET as string) as { userId: number; role: string };
+
+                            // Insert new message into database
+                            const { rows } = await pool.query(
+                                `INSERT INTO messages (channel_id, user_id, content) 
+                                 VALUES ($1, $2, $3) 
+                                 RETURNING *, 
+                                 (SELECT COALESCE(display_name, email) FROM users WHERE id = user_id) as display_name`,
+                                [parsed.channelId, decoded.userId, parsed.content]
+                            );
+
+                            // Broadcast to all clients
+                            wsServer.clients.forEach((client) => {
+                                if (client.readyState === WebSocket.OPEN) {
+                                    client.send(JSON.stringify({
+                                        type: 'new_message',
+                                        message: rows[0]
+                                    }));
+                                }
+                            });
+                        } catch (error) {
+                            // Send error back to the client
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'Invalid or expired token'
                             }));
                         }
-                    });*/
+                        break;
+
+                    case 'request_channel_messages':
+                        // Fetch messages for specific channel
+                        const messages = await pool.query(`
+                            SELECT 
+                                m.*,
+                                COALESCE(u.display_name, u.email) as display_name
+                            FROM messages m
+                            JOIN users u ON m.user_id = u.id
+                            WHERE m.channel_id = $1
+                            ORDER BY m.created_at ASC
+                        `, [parsed.channelId]);
+                        
+                        ws.send(JSON.stringify({
+                            type: 'channel_messages',
+                            channelId: parsed.channelId,
+                            messages: messages.rows
+                        }));
+                        break;
+
+                    case 'request_channels':
+                        const channels = await pool.query('SELECT * FROM channels WHERE is_dm = false');
+                        ws.send(JSON.stringify({
+                            type: 'channel_update',
+                            channels: channels.rows
+                        }));
+                        break;
+
+                    case 'request_users':
+                        const users = await pool.query(`
+                            SELECT 
+                                id,
+                                display_name,
+                                email 
+                            FROM users 
+                            ORDER BY id
+                        `);
+                        //console.log('Database users result:', users.rows);
+                        
+                        ws.send(JSON.stringify({
+                            type: 'user_update',
+                            users: users.rows
+                        }));
+                        console.log('Sent users to client:', users.rows);
+                        break;
                 }
             } catch (error) {
                 console.error('WebSocket message error:', error);
-                // Optionally send error back to the client
                 ws.send(JSON.stringify({
-                    type: 'ERROR',
+                    type: 'error',
                     error: 'Failed to process message'
                 }));
             }
+        });
+
+        // Handle client disconnect
+        ws.on('close', () => {
+            console.log('Client disconnected');
+        });
+
+        // Handle errors
+        ws.on('error', (error) => {
+            console.error('WebSocket error:', error);
         });
     });
 });
