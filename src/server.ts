@@ -68,7 +68,7 @@ const authorize = (allowedRoles: string[]) => {
 // Example route: Fetch all channels
 app.get('/api/channels', authorize(['admin', 'member']), async (req: Request, res: Response) => {
     try {
-        const { rows } = await pool.query('SELECT * FROM channels WHERE is_dm = false');
+        const { rows } = await pool.query('SELECT * FROM channels');
         res.json(rows);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -257,6 +257,66 @@ app.get('/api/users', authorize(['admin', 'member']), async (req: Request, res: 
     }
 });
 
+// Search messages across all accessible channels
+app.get('/api/messages/search', authorize(['admin', 'member']), async (req: Request, res: Response) => {
+    try {
+        const query = req.query.query as string;
+        const currentUserId = (req as any).user.userId;
+        const userRole = (req as any).user.role;
+
+        if (!query) {
+            return res.status(400).json({ error: 'Search query is required' });
+        }
+
+        console.log('Search request received', query);
+
+        // Complex query to handle both regular channels and DMs with proper access control
+        const { rows } = await pool.query(`
+            WITH accessible_channels AS (
+                SELECT id FROM channels
+                WHERE (
+                    (NOT is_dm AND (
+                        role IS NULL 
+                        OR role = $2 
+                        OR $3 = 'admin'
+                    ))
+                    OR
+                    (is_dm AND dm_participants @> ARRAY[$1]::integer[])
+                )
+            )
+            SELECT 
+                m.*,
+                COALESCE(u.display_name, u.email) as display_name,
+                c.name as channel_name,
+                c.id as channel_id,
+                c.is_dm
+            FROM messages m
+            JOIN users u ON m.user_id = u.id
+            JOIN channels c ON m.channel_id = c.id
+            WHERE 
+                m.channel_id IN (SELECT id FROM accessible_channels)
+                AND m.content ILIKE $4
+            ORDER BY m.created_at DESC
+            LIMIT 50
+        `, [currentUserId, userRole, userRole, `%${query}%`]);
+
+        // Format the response to match the Message interface
+        const formattedResults = rows.map(row => ({
+            id: row.id,
+            channel_id: row.channel_id,
+            user_id: row.user_id,
+            content: row.content,
+            created_at: row.created_at,
+            timestamp: row.created_at,
+            display_name: row.display_name
+        }));
+
+        res.json(formattedResults);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+        console.log(error, error.message);
+    }
+});
 
 // Allow requests from the frontend
 app.use(cors({ origin: '*' }));
@@ -275,12 +335,7 @@ app.listen(3000).then((socket) => {
                 const users = await pool.query('SELECT id, display_name, email FROM users ORDER BY id');
                 
                 console.log('Initial users data:', users.rows);
-                
-                ws.send(JSON.stringify({
-                    type: 'channel_update',
-                    channels: channels.rows
-                }));
-                
+                                
                 ws.send(JSON.stringify({
                     type: 'user_update',
                     users: users.rows
