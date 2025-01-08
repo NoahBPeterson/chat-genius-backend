@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS file_attachments (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_status_messages (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    status_message TEXT,
+    emoji VARCHAR(32),  -- Store emoji unicode or shortcode
+    expires_at TIMESTAMP,  -- Optional: for temporary statuses
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 ALTER TABLE channels ADD CONSTRAINT unique_channel_name UNIQUE (name);
 
 insert into channels (name) values ('general');
@@ -69,3 +79,22 @@ ALTER TABLE channels ADD COLUMN is_dm BOOLEAN DEFAULT FALSE;
 ALTER TABLE channels ADD COLUMN dm_participants INTEGER[] DEFAULT NULL;
 
 ALTER TABLE messages ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+ALTER TABLE users 
+    ADD COLUMN presence_status VARCHAR(20) DEFAULT 'offline',  -- 'online', 'idle', 'offline'
+    ADD COLUMN last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+-- First create the function that will update the timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Then create the trigger that uses this function
+CREATE TRIGGER update_user_status_messages_updated_at
+    BEFORE UPDATE ON user_status_messages
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();

@@ -29,6 +29,14 @@ const s3Client = new S3Client({
     }
 });
 
+type ConnectedClient = {
+    ws: WebSocket;
+    userId: number;
+    lastActivity: Date;
+};
+
+const connectedClients = new Map<number, ConnectedClient>();
+
 // Middleware to authenticate requests
 const authenticate = async (req: Request, res: Response, next: () => void) => {
     const token = req.headers['authorization'];
@@ -427,36 +435,105 @@ app.listen(3000).then((socket) => {
     const wsServer = new WebSocketServer({ port: 8080 });
     console.log('WebSocket server running on port 8080');
     
-    wsServer.on('connection', (ws: WebSocket) => {
+    wsServer.on('connection', async (ws: WebSocket) => {
         console.log('Client connected');
+        let userId: number | null = null;
 
-        // Send initial data on connection
-        const sendInitialData = async () => {
-            try {
-                const channels = await pool.query('SELECT * FROM channels WHERE is_dm = false');
-                const users = await pool.query('SELECT id, display_name, email FROM users ORDER BY id');
-                
-                console.log('Initial users data:', users.rows);
-                                
-                ws.send(JSON.stringify({
-                    type: 'user_update',
-                    users: users.rows
-                }));
-                console.log('Sent initial users to client:', users.rows);
-            } catch (error) {
-                console.error('Error sending initial data:', error);
-            }
-        };
-
-        sendInitialData();
-
-        // Handle messages
+        // Handle user connection with authentication
         ws.on('message', async (message) => {
             try {
                 const parsed = JSON.parse(message.toString());
-                console.log("Received websocket message:", parsed);
+                
+                if (parsed.type === 'authenticate') {
+                    const decoded = jwt.verify(parsed.token, process.env.JWT_SECRET as string) as { userId: number };
+                    userId = decoded.userId;
+                    
+                    // Store connection
+                    connectedClients.set(userId, {
+                        ws,
+                        userId,
+                        lastActivity: new Date()
+                    });
+
+                    // Update user's presence status
+                    await pool.query(
+                        'UPDATE users SET presence_status = $1, last_active = CURRENT_TIMESTAMP WHERE id = $2',
+                        ['online', userId]
+                    );
+
+                    // Broadcast updated user status to all clients
+                    broadcastUserPresence(userId, 'online');
+
+                    // Send current presence status of all users to the newly connected client
+                    const allUsersPresence = await pool.query(`
+                        SELECT 
+                            u.id, 
+                            u.presence_status,
+                            usm.status_message,
+                            usm.emoji
+                        FROM users u
+                        LEFT JOIN user_status_messages usm ON u.id = usm.user_id
+                        WHERE (usm.expires_at IS NULL OR usm.expires_at > CURRENT_TIMESTAMP)
+                        OR usm.id IS NULL
+                    `);
+                    ws.send(JSON.stringify({
+                        type: 'bulk_presence_update',
+                        presenceData: allUsersPresence.rows
+                    }));
+
+                    console.log('User', userId, 'connected');
+                }
+                
+                // Update last activity timestamp for existing messages
+                if (userId) {
+                    const client = connectedClients.get(userId);
+                    if (client) {
+                        client.lastActivity = new Date();
+                    }
+                }
 
                 switch (parsed.type) {
+                    case 'set_custom_status':
+                        try {
+                            const decoded = jwt.verify(parsed.token, process.env.JWT_SECRET as string) as { userId: number };
+                            
+                            // First, clear any existing status messages for this user
+                            await pool.query(
+                                'DELETE FROM user_status_messages WHERE user_id = $1',
+                                [decoded.userId]
+                            );
+
+                            // Insert the new status message
+                            const statusResult = await pool.query(
+                                `INSERT INTO user_status_messages 
+                                (user_id, status_message, emoji) 
+                                VALUES ($1, $2, $3)
+                                RETURNING id, status_message, emoji`,
+                                [decoded.userId, parsed.status, parsed.emoji || null]
+                            );
+
+                            // Broadcast the custom status update to all clients
+                            const message = JSON.stringify({
+                                type: 'custom_status_update',
+                                userId: decoded.userId,
+                                statusMessage: statusResult.rows[0].status_message,
+                                emoji: statusResult.rows[0].emoji
+                            });
+
+                            for (const client of connectedClients.values()) {
+                                if (client.ws.readyState === WebSocket.OPEN) {
+                                    client.ws.send(message);
+                                }
+                            }
+                        } catch (error) {
+                            console.error('Custom status update error:', error);
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'Failed to update custom status'
+                            }));
+                        }
+                        break;
+
                     case 'new_message':
                         try {
                             const decoded = jwt.verify(parsed.token, process.env.JWT_SECRET as string) as { userId: number; role: string };
@@ -595,11 +672,17 @@ app.listen(3000).then((socket) => {
                     case 'request_users':
                         const users = await pool.query(`
                             SELECT 
-                                id,
-                                display_name,
-                                email 
-                            FROM users 
-                            ORDER BY id
+                                u.id,
+                                u.display_name,
+                                u.email,
+                                u.presence_status,
+                                usm.status_message,
+                                usm.emoji
+                            FROM users u
+                            LEFT JOIN user_status_messages usm ON u.id = usm.user_id
+                            WHERE (usm.expires_at IS NULL OR usm.expires_at > CURRENT_TIMESTAMP)
+                            OR usm.id IS NULL
+                            ORDER BY u.id
                         `);
                         //console.log('Database users result:', users.rows);
                         
@@ -612,16 +695,24 @@ app.listen(3000).then((socket) => {
                 }
             } catch (error) {
                 console.error('WebSocket message error:', error);
-                ws.send(JSON.stringify({
-                    type: 'error',
-                    error: 'Failed to process message'
-                }));
             }
         });
 
-        // Handle client disconnect
-        ws.on('close', () => {
-            console.log('Client disconnected');
+        // Handle disconnection
+        ws.on('close', async () => {
+            if (userId) {
+                connectedClients.delete(userId);
+                
+                // Update user's presence status
+                await pool.query(
+                    'UPDATE users SET presence_status = $1, last_active = CURRENT_TIMESTAMP WHERE id = $2',
+                    ['offline', userId]
+                );
+
+                // Broadcast updated user status
+                broadcastUserPresence(userId, 'offline');
+                console.log('User', userId, 'disconnected');
+            }
         });
 
         // Handle errors
@@ -630,3 +721,38 @@ app.listen(3000).then((socket) => {
         });
     });
 });
+
+// Add this function to broadcast presence updates
+function broadcastUserPresence(userId: number, status: 'online' | 'idle' | 'offline') {
+    console.log(`Broadcasting presence update: User ${userId} is now ${status}`);
+    const message = JSON.stringify({
+        type: 'presence_update',
+        userId,
+        status
+    });
+
+    let broadcastCount = 0;
+    for (const client of connectedClients.values()) {
+        if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(message);
+            broadcastCount++;
+        }
+    }
+    console.log(`Presence update broadcast to ${broadcastCount} clients`);
+}
+
+// Add an idle check interval
+setInterval(async () => {
+    const now = new Date();
+    for (const [userId, client] of connectedClients.entries()) {
+        const idleTime = now.getTime() - client.lastActivity.getTime();
+        if (idleTime > 10 * 60 * 1000) { // 10 minutes
+            // Update to idle status
+            await pool.query(
+                'UPDATE users SET presence_status = $1 WHERE id = $2',
+                ['idle', userId]
+            );
+            broadcastUserPresence(userId, 'idle');
+        }
+    }
+}, 60 * 1000); // Check every minute
