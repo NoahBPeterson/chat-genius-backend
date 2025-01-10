@@ -174,10 +174,18 @@ app.get('/api/channels/:id/messages', authorize(['admin', 'member']), async (req
 
         // Fetch messages with user information
         const { rows } = await pool.query(`
-            SELECT 
-                m.*,
-                COALESCE(u.display_name, u.email) as display_name,
-                COALESCE(
+            WITH message_reactions AS (
+                SELECT 
+                    r.message_id,
+                    r.emoji,
+                    COUNT(*) as count,
+                    json_agg(r.user_id) as users
+                FROM reactions r
+                GROUP BY r.message_id, r.emoji
+            ),
+            message_attachments AS (
+                SELECT 
+                    fa.message_id,
                     json_agg(
                         json_build_object(
                             'id', fa.id,
@@ -187,9 +195,28 @@ app.get('/api/channels/:id/messages', authorize(['admin', 'member']), async (req
                             'storage_path', fa.storage_path,
                             'is_image', fa.is_image
                         )
-                    ) FILTER (WHERE fa.id IS NOT NULL),
-                    '[]'::json
-                ) as attachments,
+                    ) as attachments
+                FROM file_attachments fa
+                GROUP BY fa.message_id
+            )
+            SELECT 
+                m.*,
+                COALESCE(u.display_name, u.email) as display_name,
+                COALESCE(ma.attachments, '[]'::json) as attachments,
+                COALESCE(
+                    (
+                        SELECT json_object_agg(
+                            mr.emoji,
+                            json_build_object(
+                                'count', mr.count,
+                                'users', mr.users
+                            )
+                        )
+                        FROM message_reactions mr
+                        WHERE mr.message_id = m.id
+                    ),
+                    '{}'::json
+                ) as reactions,
                 EXISTS(
                     SELECT 1 FROM threads t WHERE t.parent_message_id = m.id LIMIT 1
                 ) as is_thread_parent,
@@ -205,9 +232,8 @@ app.get('/api/channels/:id/messages', authorize(['admin', 'member']), async (req
                 ) as thread
             FROM messages m
             JOIN users u ON m.user_id = u.id
-            LEFT JOIN file_attachments fa ON m.id = fa.message_id
+            LEFT JOIN message_attachments ma ON m.id = ma.message_id
             WHERE m.channel_id = $1 AND m.thread_id IS NULL
-            GROUP BY m.id, m.channel_id, m.user_id, m.content, m.created_at, m.thread_id, m.timestamp, u.display_name, u.email
             ORDER BY m.created_at ASC
         `, [channelId]);
 
@@ -268,7 +294,7 @@ app.post('/api/login', async (req: Request, res: Response) => {
         const token = jwt.sign(
             { userId: user.id, role: user.role }, // Include role in the JWT payload
             process.env.JWT_SECRET as string,
-            { expiresIn: '1h' }
+            { expiresIn: '24h' }
         );
         res.json({ token });
     } catch (error: any) {
@@ -305,7 +331,7 @@ app.post('/api/dm/:userId', authorize(["member", "admin"]), async (req: Request,
                 'member'
             ]
         );
-
+        console.log('Created DM channel:', rows[0]);
         res.status(201).json(rows[0]);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -393,6 +419,8 @@ app.get('/api/messages/search', authorize(['admin', 'member']), async (req: Requ
             thread_id: row.thread_id,
             thread_parent_message_id: row.thread_parent_message_id
         }));
+
+        console.log('Formatted results:', formattedResults);
 
         res.json(formattedResults);
     } catch (error: any) {
@@ -557,10 +585,18 @@ app.get('/api/threads/:threadId/messages', authorize(['admin', 'member']), async
 
         // Get all messages in the thread, including the parent message
         const { rows } = await pool.query(`
-            SELECT 
-                m.*,
-                COALESCE(u.display_name, u.email) as display_name,
-                COALESCE(
+            WITH message_reactions AS (
+                SELECT 
+                    r.message_id,
+                    r.emoji,
+                    COUNT(*) as count,
+                    json_agg(r.user_id) as users
+                FROM reactions r
+                GROUP BY r.message_id, r.emoji
+            ),
+            message_attachments AS (
+                SELECT 
+                    fa.message_id,
                     json_agg(
                         json_build_object(
                             'id', fa.id,
@@ -570,19 +606,38 @@ app.get('/api/threads/:threadId/messages', authorize(['admin', 'member']), async
                             'storage_path', fa.storage_path,
                             'is_image', fa.is_image
                         )
-                    ) FILTER (WHERE fa.id IS NOT NULL),
-                    '[]'::json
-                ) as attachments
-            FROM (
+                    ) as attachments
+                FROM file_attachments fa
+                GROUP BY fa.message_id
+            ),
+            thread_messages AS (
                 -- Get parent message
                 SELECT * FROM messages WHERE id = $1
                 UNION ALL
                 -- Get thread replies
                 SELECT * FROM messages WHERE thread_id = $2
-            ) m
+            )
+            SELECT 
+                m.*,
+                COALESCE(u.display_name, u.email) as display_name,
+                COALESCE(ma.attachments, '[]'::json) as attachments,
+                COALESCE(
+                    (
+                        SELECT json_object_agg(
+                            mr.emoji,
+                            json_build_object(
+                                'count', mr.count,
+                                'users', mr.users
+                            )
+                        )
+                        FROM message_reactions mr
+                        WHERE mr.message_id = m.id
+                    ),
+                    '{}'::json
+                ) as reactions
+            FROM thread_messages m
             JOIN users u ON m.user_id = u.id
-            LEFT JOIN file_attachments fa ON m.id = fa.message_id
-            GROUP BY m.id, m.channel_id, m.user_id, m.content, m.created_at, m.thread_id, m.timestamp, u.display_name, u.email
+            LEFT JOIN message_attachments ma ON m.id = ma.message_id
             ORDER BY m.created_at ASC
         `, [thread.parent_message_id, threadId]);
 
@@ -1171,6 +1226,92 @@ app.listen(3000).then((socket) => {
                             }
                         } catch (error) {
                             console.error('Typing status error:', error);
+                        }
+                        break;
+
+                    case 'update_reaction':
+                        try {
+                            const decoded = jwt.verify(parsed.token, process.env.JWT_SECRET as string) as { userId: number };
+                            
+                            // Start transaction
+                            const client = await pool.connect();
+                            try {
+                                await client.query('BEGIN');
+
+                                // Check if reaction already exists
+                                const existingReaction = await client.query(
+                                    'SELECT * FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
+                                    [parsed.messageId, decoded.userId, parsed.emoji]
+                                );
+                                console.log('Existing reaction:', existingReaction.rows);
+                                if (existingReaction.rows.length === 0) {
+                                    // Add the reaction if it doesn't exist
+                                    await client.query(
+                                        'INSERT INTO reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)',
+                                        [parsed.messageId, decoded.userId, parsed.emoji]
+                                    );
+                                } else {
+                                    console.log('Reaction already exists, removing it');
+                                    // Remove the reaction if it exists
+                                    await client.query(
+                                        'DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
+                                        [parsed.messageId, decoded.userId, parsed.emoji]
+                                    );
+                                }
+
+                                await client.query('COMMIT');
+
+                                // Get updated reactions for the message
+                                const updatedReactions = await pool.query(`
+                                    WITH message_reactions AS (
+                                        SELECT 
+                                            message_id,
+                                            emoji,
+                                            COUNT(*) as count,
+                                            json_agg(user_id) as users
+                                        FROM reactions
+                                        WHERE message_id = $1
+                                        GROUP BY message_id, emoji
+                                    )
+                                    SELECT 
+                                        COALESCE(
+                                            json_object_agg(
+                                                emoji,
+                                                json_build_object(
+                                                    'count', count,
+                                                    'users', users
+                                                )
+                                            ),
+                                            '{}'::json
+                                        ) as reactions
+                                    FROM message_reactions
+                                `, [parsed.messageId]);
+
+                                // Broadcast the reaction update
+                                const reactionUpdate = JSON.stringify({
+                                    type: 'reaction_update',
+                                    messageId: parsed.messageId,
+                                    reactions: updatedReactions.rows[0]?.reactions || {}
+                                });
+
+                                for (const client of connectedClients.values()) {
+                                    if (client.ws.readyState === WebSocket.OPEN) {
+                                        client.ws.send(reactionUpdate);
+                                    }
+                                }
+
+                            } catch (error) {
+                                await client.query('ROLLBACK');
+                                throw error;
+                            } finally {
+                                client.release();
+                            }
+                        } catch (error) {
+                            console.error('Update reaction error:', error);
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'Failed to update reaction'
+                            }));
                         }
                         break;
                 }
