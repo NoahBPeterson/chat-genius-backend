@@ -26,7 +26,6 @@ CREATE TABLE IF NOT EXISTS channels (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     is_private BOOLEAN DEFAULT FALSE,
-    role VARCHAR(50) DEFAULT 'member',
     is_dm BOOLEAN DEFAULT FALSE,
     dm_participants INTEGER[] DEFAULT NULL
 );
@@ -45,6 +44,20 @@ CREATE TABLE IF NOT EXISTS user_tokens (
     expires_at TIMESTAMP NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- Function to clean up expired tokens
+CREATE OR REPLACE FUNCTION cleanup_expired_tokens()
+RETURNS trigger AS $$
+BEGIN
+    DELETE FROM user_tokens WHERE expires_at < CURRENT_TIMESTAMP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger to clean up expired tokens after each insert
+CREATE TRIGGER cleanup_expired_tokens_trigger
+    AFTER INSERT ON user_tokens
+    EXECUTE FUNCTION cleanup_expired_tokens();
 
 CREATE TABLE IF NOT EXISTS file_attachments (
     id SERIAL PRIMARY KEY,
@@ -71,10 +84,11 @@ ALTER TABLE channels ADD CONSTRAINT unique_channel_name UNIQUE (name);
 
 insert into channels (name) values ('general');
 
+-- Add role-based permissions
 ALTER TABLE users ADD COLUMN role VARCHAR(50) DEFAULT 'member';
 ALTER TABLE channels ADD COLUMN role VARCHAR(50) DEFAULT 'member';
 
-# Adding DMs
+-- Adding DMs
 ALTER TABLE channels ADD COLUMN is_dm BOOLEAN DEFAULT FALSE;
 ALTER TABLE channels ADD COLUMN dm_participants INTEGER[] DEFAULT NULL;
 
