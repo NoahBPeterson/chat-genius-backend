@@ -13,7 +13,7 @@ export class ChannelController {
 
     private registerRoutes() {
         this.app.get('/api/channels', authorize(['admin', 'member']), this.getAllChannels.bind(this));
-        this.app.post('/api/channels', authorize(['admin']), this.createChannel.bind(this));
+        this.app.post('/api/channels', authorize(['admin', 'member']), this.createChannel.bind(this));
         this.app.get('/api/channels/:id', authorize(['admin', 'member']), this.getChannelById.bind(this));
         this.app.get('/api/channels/:id/messages', authorize(['admin', 'member']), this.getChannelMessages.bind(this));
     }
