@@ -1,4 +1,12 @@
 (executable
  (name main)
  (public_name chat_genius)
- (libraries chat_genius_lib jwto)) 
+ (libraries 
+  chat_genius_lib 
+  dream 
+  yojson 
+  pgx_lwt_unix 
+  cryptokit 
+  jwto
+  aws-s3-lwt)
+ (preprocess (pps ppx_deriving_yojson ppx_protocol_conv_json ppx_protocol_conv_xmlm))) 
