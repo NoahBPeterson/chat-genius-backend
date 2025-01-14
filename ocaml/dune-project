@@ -24,10 +24,14 @@
   dune 
   dream 
   yojson 
-  ppx_deriving_yojson 
+  ppx_deriving
+  ppx_deriving_yojson
   pgx 
+  pgx_value_core
   pgx_lwt_unix 
-  cryptokit 
+  cryptokit
+  lwt
+  lwt_ppx
   jwto
   aws-s3-lwt))
 

@@ -432,7 +432,7 @@ let () =
                     let* body = Dream.body request in
                     match Yojson.Safe.from_string body |> upload_request_of_yojson with
                     | Error _ -> Dream.json ~status:`Bad_Request {|{"error": "Invalid JSON"}|}
-                    | Ok { filename; content_type; size } ->
+                    | Ok { filename; content_type; size = _ } ->
                         let storage_path = Printf.sprintf "uploads/%d-%s" (int_of_float (Unix.time ())) filename in
                         let credentials, region, bucket = get_s3_client () in
                         let* url_result = S3_client.presign_put ~credentials ~region ~bucket ~key:storage_path ~content_type () in
@@ -465,7 +465,7 @@ let () =
                     | None -> Dream.json ~status:`Not_Found {|{"error": "File not found"}|}
                     | Some file ->
                         let credentials, region, bucket = get_s3_client () in
-                        let expiry = if file.is_image then 24 * 3600 else 300 in
+                        let _expiry = if file.is_image then 24 * 3600 else 300 in
                         let* url_result = S3_client.presign_get ~credentials ~region ~bucket ~key:file.storage_path () in
                         match url_result with
                         | Ok download_url ->
