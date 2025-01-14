@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name chat_genius)
+ (libraries chat_genius_lib jwto)) 
