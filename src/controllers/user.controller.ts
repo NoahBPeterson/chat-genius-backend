@@ -35,14 +35,21 @@ export class UserController {
     }
 
     private async login(req: Request, res: Response) {
-        const { email, password } = await req.json();
         try {
+            const { email, password } = await req.json();
+
             const userResult = await this.pool.query('SELECT * FROM users WHERE email = $1', [email]);
-            if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+            if (userResult.rows.length === 0) {
+                console.log('User not found for email:', email);
+                return res.status(404).json({ error: 'User not found' });
+            }
     
             const user: User = userResult.rows[0];
             const isMatch = await bcrypt.compare(password, user.password_hash);
-            if (!isMatch) return res.status(401).json({ error: 'Invalid password' });
+            if (!isMatch) {
+                console.log('Invalid password for user:', email);
+                return res.status(401).json({ error: 'Invalid password' });
+            }
     
             const token = jwt.sign(
                 { userId: user.id, role: user.role },
@@ -60,6 +67,8 @@ export class UserController {
 
             res.json({ token });
         } catch (error: any) {
+            console.error('Login error:', error);
+            console.error('Error stack:', error.stack);
             res.status(500).json({ error: error.message });
         }
     }

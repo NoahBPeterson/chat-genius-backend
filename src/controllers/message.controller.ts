@@ -24,8 +24,6 @@ export class MessageController {
                 return res.status(400).json({ error: 'Search query is required' });
             }
     
-            console.log('Search request received', query);
-    
             // Complex query to handle both regular channels and DMs with proper access control
             const { rows } = await this.pool.query(`
                 WITH accessible_channels AS (
@@ -77,8 +75,6 @@ export class MessageController {
                 thread_id: row.thread_id,
                 thread_parent_message_id: row.thread_parent_message_id
             }));
-    
-            console.log('Formatted results:', formattedResults);
     
             res.json(formattedResults);
         } catch (error: any) {
@@ -217,7 +213,7 @@ export class MessageController {
                 WHERE t.channel_id = $1
                 ORDER BY t.last_reply_at DESC
             `, [channelId]);
-            console.log('Thread list:', rows);
+
             res.json(rows);
         } catch (error: any) {
             res.status(500).json({ error: error.message });

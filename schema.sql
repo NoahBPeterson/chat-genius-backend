@@ -203,3 +203,5 @@ CREATE TRIGGER update_thread_stats
     AFTER INSERT OR DELETE ON messages
     FOR EACH ROW
     EXECUTE FUNCTION update_thread_counters();
+
+ALTER TABLE messages ADD COLUMN is_ai_generated BOOLEAN DEFAULT false;

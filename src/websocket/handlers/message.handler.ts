@@ -2,8 +2,17 @@ import { WebSocket } from 'ws';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
 import { ConnectedClient } from 'types/websocket.types';
+import { RAGFusion } from '../../services/rag-fusion.service';
+
+// Get the singleton instance of RAGFusion
+let ragService: RAGFusion;
+
 
 export const handleNewMessage = async (ws: WebSocket, parsedMessage: any, pool: pg.Pool, connectedClients: Map<number, ConnectedClient>) => {
+    // Initialize RAGFusion with pool if not already initialized
+    if (!ragService) {
+        ragService = RAGFusion.getInstance(pool);
+    }
     try {
         const decoded = jwt.verify(parsedMessage.token, process.env.JWT_SECRET as string) as { userId: number; role: string };
         
@@ -11,6 +20,13 @@ export const handleNewMessage = async (ws: WebSocket, parsedMessage: any, pool: 
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
+            
+            // Check if this is a DM channel
+            const channelResult = await client.query(
+                'SELECT is_dm FROM channels WHERE id = $1',
+                [parsedMessage.channelId]
+            );
+            const isDM = channelResult.rows[0]?.is_dm;
             
             // Insert message
             const messageResult = await client.query(
@@ -24,8 +40,6 @@ export const handleNewMessage = async (ws: WebSocket, parsedMessage: any, pool: 
             
             // Handle attachments
             if (parsedMessage.attachments?.length > 0) {
-                
-                // Insert file attachments
                 const attachmentPromises = parsedMessage.attachments.map((attachment: { filename: string, mime_type?: string, size?: number, storage_path: string }) => {
                     return client.query(
                         `INSERT INTO file_attachments (message_id, filename, mime_type, size, storage_path, is_image)
@@ -73,15 +87,97 @@ export const handleNewMessage = async (ws: WebSocket, parsedMessage: any, pool: 
                 GROUP BY m.id, u.display_name, u.email
             `, [message.id]);
 
-            // Broadcast to all clients
+            const completeMessage = fullMessage.rows[0];
+
+            // Broadcast original message to all clients
             for (const client of connectedClients.values()) {
                 if (client.ws.readyState === WebSocket.OPEN) {
                     client.ws.send(JSON.stringify({
                         type: 'new_message',
-                        message: fullMessage.rows[0]
+                        message: completeMessage
                     }));
                 }
             }
+
+            // Add message to RAG system if not a DM
+            if (!isDM) {
+                await ragService.addChatMessage({
+                    id: completeMessage.id,
+                    content: completeMessage.content,
+                    userId: decoded.userId.toString(),
+                    channelId: completeMessage.channel_id,
+                    threadId: completeMessage.thread_id?.toString() || '',
+                    displayName: completeMessage.display_name
+                });
+            }
+
+            // Check for @-mentions and generate responses
+            if (parsedMessage.content?.includes('@')) {
+                try {
+                    // Get all users that could be mentioned
+                    const { rows: users } = await client.query(
+                        'SELECT id, display_name, email FROM users'
+                    );
+
+                    // Find mentioned user
+                    const mentionedUser = users.find(user => {
+                        const mention = user.display_name ? `@${user.display_name}` : `@${user.email}`;
+                        const isMatch = parsedMessage.content.includes(mention);
+                        return isMatch;
+                    });
+
+                    if (mentionedUser) {
+                        // Create query from message content (remove the @mention)
+                        const userQuery = parsedMessage.content
+                            .replace(`@${mentionedUser.display_name}`, '')
+                            .replace(`@${mentionedUser.email}`, '')
+                            .trim();
+                        
+                        // Generate avatar response as the mentioned user
+                        const avatarResponse = await ragService.generateAvatarResponse(
+                            userQuery,
+                            mentionedUser.id.toString(),
+                            mentionedUser.display_name || mentionedUser.email
+                        );
+
+                        // Insert response as a message from the mentioned user
+                        const avatarMessageResult = await client.query(
+                            `INSERT INTO messages (channel_id, user_id, content, is_ai_generated)
+                             VALUES ($1, $2, $3, true)
+                             RETURNING *`,
+                            [parsedMessage.channelId, mentionedUser.id, avatarResponse]
+                        );
+
+                        // Get complete avatar message with user info
+                        const fullAvatarMessage = await client.query(`
+                            SELECT 
+                                m.*,
+                                COALESCE(u.display_name, u.email) as display_name
+                            FROM messages m
+                            JOIN users u ON m.user_id = u.id
+                            WHERE m.id = $1
+                        `, [avatarMessageResult.rows[0].id]);
+                        fullAvatarMessage.rows[0].display_name = `AI Avatar of ${fullAvatarMessage.rows[0].display_name}`;
+
+                        // Broadcast avatar's response
+                        for (const client of connectedClients.values()) {
+                            if (client.ws.readyState === WebSocket.OPEN) {
+                                const message = {
+                                    type: 'new_message',
+                                    message: fullAvatarMessage.rows[0]
+                                };
+                                client.ws.send(JSON.stringify(message));
+                            }
+                        }
+                    } else {
+                        console.log('No matching user found for @mention in message:', parsedMessage.content);
+                    }
+                } catch (error) {
+                    console.error('Error generating user avatar response:', error);
+                    // Don't throw - we want to continue even if avatar response fails
+                }
+            }
+
 
         } catch (error) {
             await client.query('ROLLBACK');
@@ -230,6 +326,9 @@ export const handleCreateThread = async (ws: WebSocket, parsedMessage: any, pool
 };
 
 export const handleThreadMessage = async (ws: WebSocket, parsedMessage: any, pool: pg.Pool, connectedClients: Map<number, ConnectedClient>) => {
+    if (!ragService) {
+        ragService = RAGFusion.getInstance(pool);
+    }
 
     try {
         const decoded = jwt.verify(parsedMessage.token, process.env.JWT_SECRET as string) as { userId: number; role: string };
@@ -238,6 +337,13 @@ export const handleThreadMessage = async (ws: WebSocket, parsedMessage: any, poo
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
+            
+            // Check if this is a DM channel
+            const channelResult = await client.query(
+                'SELECT is_dm FROM channels WHERE id = $1',
+                [parsedMessage.channelId]
+            );
+            const isDM = channelResult.rows[0]?.is_dm;
             
             // Insert message
             const messageResult = await client.query(
@@ -298,6 +404,24 @@ export const handleThreadMessage = async (ws: WebSocket, parsedMessage: any, poo
                 GROUP BY m.id, m.channel_id, m.user_id, m.content, m.created_at, m.thread_id, m.timestamp, u.display_name, u.email
             `, [message.id]);
 
+            const completeMessage = fullMessage.rows[0];
+
+            // Only add to RAG if not a DM
+            if (!isDM) {
+                ragService.addChatMessage({
+                    id: completeMessage.id,
+                    content: completeMessage.content,
+                    userId: decoded.userId.toString(),
+                    channelId: completeMessage.channel_id,
+                    threadId: completeMessage.thread_id?.toString() || '',
+                    displayName: completeMessage.display_name
+                }).then(() => {
+                    console.log('Added message to RAG:', completeMessage.id);
+                }).catch((error) => {
+                    console.error('Error adding message to RAG:', error);
+                });
+            }
+
             // Also get updated thread info
             const threadInfo = await client.query(`
                 SELECT 
@@ -315,7 +439,7 @@ export const handleThreadMessage = async (ws: WebSocket, parsedMessage: any, poo
             const threadMessage = JSON.stringify({
                 type: 'thread_message',
                 threadId: parsedMessage.threadId,
-                message: fullMessage.rows[0],
+                message: completeMessage,
                 thread: {
                     id: threadInfo.rows[0].id,
                     channel_id: threadInfo.rows[0].channel_id,
