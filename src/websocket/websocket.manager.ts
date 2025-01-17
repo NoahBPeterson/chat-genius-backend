@@ -61,7 +61,7 @@ export class WebSocketManager {
 
     private handleMessage() {
         this.wsServer.on('connection', async (ws: WebSocket) => {
-            console.log('New client attempting to connect...');
+            console.log('New WebSocket connection attempt...');
             let userId: number | null = null;
             let authTimeout: NodeJS.Timeout;
 
@@ -84,55 +84,34 @@ export class WebSocketManager {
             // Handle user connection with authentication
             ws.on('message', async (message) => {
                 try {
+                    console.log('Received message type:', JSON.parse(message.toString()).type);
                     const parsedMessage = JSON.parse(message.toString());
 
                     if (parsedMessage.type === 'authenticate') {
                         try {
+                            console.log('Starting authentication...');
                             const decoded = jwt.verify(parsedMessage.token, process.env.JWT_SECRET as string) as { userId: number };
                             userId = decoded.userId;
                             
                             // Clear auth timeout
                             clearTimeout(authTimeout);
 
-                            // Store connection
+                            // Store connection immediately
                             this.connectedClients.set(userId, {
                                 ws,
                                 userId,
                                 lastActivity: new Date()
                             });
 
-                            // Update user's presence status and fetch all users' presence in parallel
-                            const [_, allUsersPresence] = await Promise.all([
-                                this.pool.query(
-                                    'UPDATE users SET presence_status = $1, last_active = CURRENT_TIMESTAMP WHERE id = $2',
-                                    ['online', userId]
-                                ),
-                                this.pool.query(`
-                                    SELECT 
-                                        u.id, 
-                                        u.presence_status,
-                                        usm.status_message,
-                                        usm.emoji
-                                    FROM users u
-                                    LEFT JOIN user_status_messages usm ON u.id = usm.user_id
-                                    WHERE (usm.expires_at IS NULL OR usm.expires_at > CURRENT_TIMESTAMP)
-                                    OR usm.id IS NULL
-                                `)
-                            ]);
-
-                            // Send success response
+                            // Send immediate auth success
+                            console.log('Authentication successful for user:', userId);
                             ws.send(JSON.stringify({ type: 'auth_success' }));
 
-                            // Broadcast presence updates
-                            this.broadcastUserPresence(userId, 'online');
-                            
-                            // Send bulk presence update
-                            ws.send(JSON.stringify({
-                                type: 'bulk_presence_update',
-                                presenceData: allUsersPresence.rows
-                            }));
+                            // Handle presence updates and user data in the background
+                            this.handlePostAuthentication(userId, ws).catch(error => {
+                                console.error('Error in post-authentication:', error);
+                            });
 
-                            console.log('User', userId, 'successfully connected and authenticated');
                             return;
                         } catch (error) {
                             console.error('Authentication failed:', error);
@@ -230,6 +209,45 @@ export class WebSocketManager {
                 console.error('WebSocket error:', error);
             });
         });
+    }
+
+    private async handlePostAuthentication(userId: number, ws: WebSocket) {
+        try {
+            console.log('Starting post-authentication tasks for user:', userId);
+            
+            // Update user's presence status
+            await this.pool.query(
+                'UPDATE users SET presence_status = $1, last_active = CURRENT_TIMESTAMP WHERE id = $2',
+                ['online', userId]
+            );
+            console.log('Updated presence status for user:', userId);
+
+            // Broadcast presence update
+            this.broadcastUserPresence(userId, 'online');
+
+            // Fetch and send current presence status of all users
+            const allUsersPresence = await this.pool.query(`
+                SELECT 
+                    u.id, 
+                    u.presence_status,
+                    usm.status_message,
+                    usm.emoji
+                FROM users u
+                LEFT JOIN user_status_messages usm ON u.id = usm.user_id
+                WHERE (usm.expires_at IS NULL OR usm.expires_at > CURRENT_TIMESTAMP)
+                OR usm.id IS NULL
+            `);
+
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'bulk_presence_update',
+                    presenceData: allUsersPresence.rows
+                }));
+                console.log('Sent bulk presence update to user:', userId);
+            }
+        } catch (error) {
+            console.error('Error in post-authentication tasks:', error);
+        }
     }
 
     // Add this function to broadcast presence updates
