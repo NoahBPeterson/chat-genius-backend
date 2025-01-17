@@ -215,6 +215,14 @@ export class WebSocketManager {
         try {
             console.log('Starting post-authentication tasks for user:', userId);
             
+            // Get user details
+            const userResult = await this.pool.query(
+                `SELECT id, display_name, email, presence_status 
+                 FROM users WHERE id = $1`,
+                [userId]
+            );
+            const user = userResult.rows[0];
+
             // Update user's presence status
             await this.pool.query(
                 'UPDATE users SET presence_status = $1, last_active = CURRENT_TIMESTAMP WHERE id = $2',
@@ -222,8 +230,9 @@ export class WebSocketManager {
             );
             console.log('Updated presence status for user:', userId);
 
-            // Broadcast presence update
+            // Broadcast presence update and user join
             this.broadcastUserPresence(userId, 'online');
+            this.broadcastUserJoin(user);
 
             // Fetch and send current presence status of all users
             const allUsersPresence = await this.pool.query(`
@@ -248,6 +257,29 @@ export class WebSocketManager {
         } catch (error) {
             console.error('Error in post-authentication tasks:', error);
         }
+    }
+
+    private broadcastUserJoin(user: { id: number; display_name: string; email: string; presence_status: string }) {
+        console.log(`Broadcasting user join: ${user.display_name} (${user.id})`);
+        const message = JSON.stringify({
+            type: 'user_joined',
+            user: {
+                id: user.id,
+                display_name: user.display_name,
+                email: user.email,
+                presence_status: user.presence_status
+            }
+        });
+
+        let broadcastCount = 0;
+        for (const client of this.connectedClients.values()) {
+            // Don't send join message to the user who just joined
+            if (client.userId !== user.id && client.ws.readyState === WebSocket.OPEN) {
+                client.ws.send(message);
+                broadcastCount++;
+            }
+        }
+        console.log(`User join broadcast to ${broadcastCount} clients`);
     }
 
     // Add this function to broadcast presence updates
