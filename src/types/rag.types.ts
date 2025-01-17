@@ -14,10 +14,15 @@ export interface OpenAIConfig {
     tracingV2: boolean;
   }
   
+  export interface MoondreamConfig {
+    apiKey: string;
+  }
+  
   export interface AppConfig {
     openai: OpenAIConfig;
     pinecone: PineconeConfig;
     langchain: LangChainConfig;
+    moondream: MoondreamConfig;
   }
   
   export interface SearchResult {

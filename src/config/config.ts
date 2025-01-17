@@ -18,6 +18,9 @@ export const config: AppConfig = {
     project: process.env.LANGCHAIN_PROJECT || '',
     tracingV2: process.env.LANGCHAIN_TRACING_V2 === 'true',
   },
+  moondream: {
+    apiKey: process.env.MOONDREAM_API_KEY || '',
+  },
 };
 
 // Validate configuration

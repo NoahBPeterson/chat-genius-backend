@@ -205,3 +205,38 @@ CREATE TRIGGER update_thread_stats
     EXECUTE FUNCTION update_thread_counters();
 
 ALTER TABLE messages ADD COLUMN is_ai_generated BOOLEAN DEFAULT false;
+
+-- Productivity tracking tables
+CREATE TABLE IF NOT EXISTS user_productivity_settings (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    tracking_enabled BOOLEAN DEFAULT false,
+    screen_capture_enabled BOOLEAN DEFAULT false,
+    webcam_capture_enabled BOOLEAN DEFAULT false,
+    break_reminder_interval INTEGER DEFAULT 3600, -- seconds (1 hour)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS productivity_sessions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP,
+    is_productive BOOLEAN,
+    last_check_time TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Add new presence statuses for productivity tracking
+ALTER TABLE users 
+    ALTER COLUMN presence_status TYPE VARCHAR(50),
+    ADD CONSTRAINT presence_status_check 
+    CHECK (presence_status IN ('offline', 'online', 'idle', 'productive_working', 'idle_and_not_working'));
+
+-- Create trigger for updating timestamps
+CREATE TRIGGER update_user_productivity_settings_updated_at
+    BEFORE UPDATE ON user_productivity_settings
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
