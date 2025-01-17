@@ -62,20 +62,6 @@ export const handleProductivityScreenshot = async (
   connectedClients: Map<number, ConnectedClient>
 ) => {
   try {
-    console.log('Received productivity message:', {
-      type: parsedMessage.type,
-      userId: parsedMessage.userId,
-      hasData: !!parsedMessage.data,
-      dataKeys: parsedMessage.data ? Object.keys(parsedMessage.data) : [],
-      screenImageLength: parsedMessage.data?.screen_image?.length,
-      fullMessage: JSON.stringify(parsedMessage, (key, value) => {
-        if (key === 'screen_image' && typeof value === 'string') {
-          return `[base64 string length: ${value.length}]`;
-        }
-        return value;
-      }, 2)
-    });
-
     const userId = parsedMessage.userId;
     const base64Image = parsedMessage.data?.screen_image;
 
