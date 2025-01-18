@@ -21,15 +21,26 @@ export class UserController {
     private async register(req: Request, res: Response) {
         try {
             const body = await req.json();
-            const { email, password, displayName } = body;
-            
+            const { email, password, displayname } = body;
+
+            if (!displayname) {
+                console.warn('No display name provided during registration');
+            }
+
             const hashedPassword = await bcrypt.hash(password, 10);
             await this.pool.query(
-                'INSERT INTO users (email, password_hash, display_name) VALUES ($1, $2, $3)',
-                [email, hashedPassword, displayName]
+                'INSERT INTO users (email, password_hash, display_name) VALUES ($1, $2, $3) RETURNING id, email, display_name',
+                [email, hashedPassword, displayname]
             );
+
             res.status(201).json({ message: 'User registered successfully' });
         } catch (error: any) {
+            console.error('Registration error:', {
+                error: error.message,
+                stack: error.stack,
+                code: error.code,
+                detail: error.detail
+            });
             res.status(500).json({ error: error.message });
         }
     }
