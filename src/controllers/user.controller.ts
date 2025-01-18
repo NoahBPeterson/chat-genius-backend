@@ -21,28 +21,46 @@ export class UserController {
     private async register(req: Request, res: Response) {
         try {
             const body = await req.json();
-            const { email, password, displayName } = body;
-            
+            const { email, password, displayname } = body;
+
+            if (!displayname) {
+                console.warn('No display name provided during registration');
+            }
+
             const hashedPassword = await bcrypt.hash(password, 10);
             await this.pool.query(
-                'INSERT INTO users (email, password_hash, display_name) VALUES ($1, $2, $3)',
-                [email, hashedPassword, displayName]
+                'INSERT INTO users (email, password_hash, display_name) VALUES ($1, $2, $3) RETURNING id, email, display_name',
+                [email, hashedPassword, displayname]
             );
+
             res.status(201).json({ message: 'User registered successfully' });
         } catch (error: any) {
+            console.error('Registration error:', {
+                error: error.message,
+                stack: error.stack,
+                code: error.code,
+                detail: error.detail
+            });
             res.status(500).json({ error: error.message });
         }
     }
 
     private async login(req: Request, res: Response) {
-        const { email, password } = await req.json();
         try {
+            const { email, password } = await req.json();
+
             const userResult = await this.pool.query('SELECT * FROM users WHERE email = $1', [email]);
-            if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+            if (userResult.rows.length === 0) {
+                console.log('User not found for email:', email);
+                return res.status(404).json({ error: 'User not found' });
+            }
     
             const user: User = userResult.rows[0];
             const isMatch = await bcrypt.compare(password, user.password_hash);
-            if (!isMatch) return res.status(401).json({ error: 'Invalid password' });
+            if (!isMatch) {
+                console.log('Invalid password for user:', email);
+                return res.status(401).json({ error: 'Invalid password' });
+            }
     
             const token = jwt.sign(
                 { userId: user.id, role: user.role },
@@ -60,6 +78,8 @@ export class UserController {
 
             res.json({ token });
         } catch (error: any) {
+            console.error('Login error:', error);
+            console.error('Error stack:', error.stack);
             res.status(500).json({ error: error.message });
         }
     }
